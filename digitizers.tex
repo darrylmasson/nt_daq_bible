@@ -1,0 +1,17 @@
+\chapter{Digitizers, Crate Controllers, and Logic Modules, oh my!}
+
+Much of this chapter deals with the intricacies and nuances of the CAEN V1724, but the general principles can be applied to other makes and models, provided the same principles hold.
+The V1724 is not designed to do any on-board processing beyond its deadtime-free circular buffer and ZLE, unlike (for instance) the Skutek that implements the HEV.
+
+\section{V1724}
+
+This digitizer is the workhorse of the DAQ.
+The TPC readout uses 62 for the main PMT channels, a further 32 for the high-energy channels, and a 95th as the acquisition monitor.
+While it is by and large very reliable, it has the occasional quirk.
+
+\subsection{Timestamps}
+
+Perhaps the most annoying limitation is its internal timestamp clock.
+The V1724 timestamp clock runs at the same \SI{100}{\mega\hertz} as the ADC, but the on-board counter only has 31 bits.
+This means that the clock will roll over every \SI{21.47483648}{\second}.
+There are a few ways of dealing with this. 

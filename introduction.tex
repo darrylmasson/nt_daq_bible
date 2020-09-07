@@ -1,0 +1,86 @@
+\chapter{Introduction}\label{ch:intro}
+
+If you're reading this, it probably means one of two things.
+Either you're curious and want to learn about the XENONnT DAQ system, perhaps you wish to learn from our mistakes and do better, or (highly unlikely) you want to learn more about how the data you analyze is brought into existence in the first place.
+Or, those who originally designed and built the system have left, it suddenly stopped working while the neutron generator was deployed, and Elena is yelling at you to make it work again, and yesterday.
+If the second is true, you have my sympathy, but the best time to read this would have been last month.
+
+\section{Design philosophy}\label{sec:philosophy}
+
+To understand many of the decisions made in the design of the nT readout, we must consider things that did and didn't work in 1T.
+
+\subsection{XENON1T}\label{sec:1tdaq}
+
+The reader is assumed to have a detailed undestanding of~\cite{}.
+
+The XENON1T DAQ was designed around the idea of a ``triggerless'' readout, in which the decision of trigger or not was delayed until the data was sitting around in memory of the readout servers, rather than making this decision at the hardware level.
+XENON1T still had a trigger, it's just that this was a trigger implemented in software rather than in hardware.
+While this was quite successful, it did suffer from a number of unforseeable errors.
+Using a database as the central buffer is a good idea, until your rate of inserts begins to saturate the bandwidth your database can handle.
+MongoDB suffers from this with its primary-secondary replication setup, because all writes must be directed to the primary, and it is but one node.
+As the XENONnT DAQ will be 3-4 times larger than that of 1T, this would become more of a bottleneck.
+
+The ``trigger'' was implemented in python (referred to semi-technically as the ``event-builder'').
+This software scanned the timestamps of inserts to the database for ``event-like'' patterns and then passed this information off to secondary machines for the actual rendering of events into a data format suitable for replication, storage, and processing.
+The RabbitMQ queue used for passing these events around was not ideal.
+A minor memory leak somewhere in the chain caused it to crash about once per month.
+Not major enough to get fixed, but still a minor annoyance for the duration of the experiment.
+
+\subsection{XENONnT}
+
+The changes made for nT were to enable the following requirements to be met:
+\begin{itemize}
+  \item Read out one PMT array twice
+  \item Combined data stream with synchronized readout between different sub-detectors
+  \item Readout compatible with strax
+  \item Better uptime, stability, etc etc
+\end{itemize}
+
+\subsubsection{PMT readout}
+
+The ADCs have a limited dynamic voltage range.
+The V1724 accepts \SI{2.25}{\volt} or \SI{0.5}{\volt} (hardware modification), the V1730 accepts \SI{2}{\volt} or \SI{0.5}{\volt} (software-selection).
+The single photon signals from a PMT are rather small, so they need to be amplified to reach the science goals of the experiment.
+The typical amplification factor is 10, achieved via the Phillips 776.
+Thus, if the signal output by the amplifier reaches \SI{2.25}{\volt}, the responsible digitizer channel saturates and the energy response becomes non-linear.
+The PMT base can also saturate, but this happens at a \emph{much} higher energy (allegedly).
+This non-linearity in the response significantly hampers the efforts of position reconstruction, which is a leading factor in the sensitivity to high-energy analyses like double-beta decay.
+Thus, the solution was to read out the top PMT array once with amplification (for low-energy analyses) and once with attenuation (for high-energy purposes).
+This means that rather than merely doubling in size with the number of PMTs, the readout triples because half of the PMTs are read out twice.
+
+\subsubsection{Inter-detector synchronization}
+
+The synchronized starting and stopping of multiple (crates of) digitizers is handled most easily by the V2718 crate controller module.
+That's not what I'm talking about here.
+There was ``no'' synchronization between the TPC and MV in 1T.
+They used the same \SI{50}{\mega\hertz} clock signal propagated from the last TPC board to the first MV board, but that's different.
+How do you ensure the start command issued by the dispatcher is registered by the software interfacing with the different detector CC's with the same $\mathcal{O}(\SI{10}{\nano\second})$ precision that each individual system has?
+It is impossible unless the system is specifically designed to achieve this.
+The ``synchronization'' in 1T was handled by digitizing the MV trigger signal with the AM.
+This way, the analyist can see that something happened at this time in the MV, but can see nothing more.
+
+This was not sufficient for nT.
+The analyst for nT should be able to see exactly what was happening in the veto subdetectors simultaneously with the TPC.
+A better inter-detector integration was required.
+This is achieved by fanning the start signal from the TPC CC to the other sub-detectors, and adding a considerable amount of additional logic into the dispatcher.
+It is important that the signals are received by various digitizers within \SI{10}{\nano\second} of each other.
+
+\subsubsection{Strax compatibility}
+
+Pax is another of those things that was a good idea at the time, but in hindsight certain issues were found.
+Pax's memory model meant it was rather slow, and the insistance relatively early on that it support ROOT led to countless errors and issues that plagued analysts (I know who you are, and I know which instituion you work for, and I know how much you contributed to this support).
+Pax's design was also grounded in the conventional idea of ``events'' and ``triggers''.
+Strax was envisioned as a radically new way of thinking about data processing without the baggage of enforcing a predefined structure of events, and also with a more flexible paradigm of streaming data rather than monolithic ``runs''.
+While the overall readout design is largely independent of the format you end up processing data in, a variety of optimizations can be made rather than support arbitrary storage/processing setups.
+
+\subsubsection{Uptime}
+
+For a system as fundamental and important as the PMT readout, it's important that it is ready for operation by the time the PMTs are installed, and that it is available more often than not.
+The goings-on inside the detector are understood by means of the slow control and the fast readout.
+Growing pains are allowed, but it's a very bad look if the PMTs are installed and the readout isn't anything resembling ready.
+Additionally, systematic crashes should be understood and fixed where possible.
+
+\section{Sir Not-Appearing-In-This-Film}
+
+This document is concerned turning PMT signals into disk usage.
+Making this data available to the analyist is someone else's problem, and will not be addressed here.
