@@ -1,0 +1,166 @@
+\chapter{Dispatcher bug report, 2021-05-03}\label{ch:bugreport}
+
+On 3 May, we found a new bug in the dispatcher of a particularly pernicious and pervasive persuasion.
+This is the story of this bug, how it happened, and all the steps involved in restoring regular operations.
+Be ye warned, it's a doozy.
+Note: all timestamps are in UTC, and the logs were doctored slightly to fit onto a single line.
+
+\section{Background}
+
+We had just finished a failed test of linked mode with all three detectors.
+It failed for a variety of reasons.
+One, only the MV was seeing any data.
+Two, the NV kept killing itself because the channel map was incomplete.
+The first was probably due to baselines; the second was a subtle error in the script that generates the board and channel configs that only applied to the V1730.
+Neither of these were the real cause of the chaos that ensued.
+
+We were transitioning between linked and unlinked operation, and I had always predicted some shenanigans would be possible in these situations.
+The real cause here was ``garbage in, garbage out'', with the cause of the garbage being a certain unnamed individual who may or may not have been ``responsible'' for one of the vetoes.
+The dispatcher issues commands only to the processes necessary.
+This by itself has some nuance.
+If a run is active, the hosts that should receive the command can be obtained from the config doc for that mode.
+If a run is not active, you can just refer to the configured nodes.
+If the config doc in question contains ``nonsense'' hosts because someone didn't fill the base information correctly, you'll get commands being issued to hosts that don't exist.
+Hosts that don't exist can't acknowledge commands issued to them.
+
+\section{Part 1}
+
+At the end of the linked mode tests, the following STOP was issued:
+\begin{verbatim}
+{
+    ``_id'': ObjectID(``6090057e7885d063228ef151''),
+    ``command'' : ``stop'',
+    ``user'' : ``masson'',
+    ``detector'' : ``tpc'',
+    ``mode'' : ``full_link_test'',
+    ``createdAt'' : ISODate(``2021-05-03T14:15:26.162Z''),
+    ``host'' : [
+        ``reader2_reader_0'',
+        ``reader0_reader_0'',
+        ``reader1_reader_0'',
+        ``reader6_reader_0'',
+        ``reader6_reader_0_reader_0'',
+        ``reader5_reader_0''
+    ],
+    ``acknowledged'' : {
+        ...
+    }
+
+}
+\end{verbatim}
+One of the listed hosts clearly isn't going to acknowledge this command because it doesn't exist.
+Anyway, a new run was started in unlinked mode.
+At the end of that run, this appeared in the dispatcher logs:
+\begin{verbatim}
+2021-05-03 15:32:41 | [DEBUG] | The tpc should be ACTIVE and
+  is RUNNING (18117)
+2021-05-03 15:32:41 | [DEBUG] | The muon_veto should be INACTIVE
+  and is IDLE
+2021-05-03 15:32:41 | [DEBUG] | The neutron_veto should be ACTIVE
+  and is ARMING (18137)
+2021-05-03 15:32:41 | [DEBUG] | Linking: tpc-mv: False,
+  tpc-nv: False, mv-nv: False
+2021-05-03 15:32:41 | [INFO]  | The tpc is running
+2021-05-03 15:32:41 | [DEBUG] | Checking run turnover for
+  tpc: 3601/3600
+2021-05-03 15:32:41 | [INFO]  | Stopping run for tpc
+2021-05-03 15:32:41 | [DEBUG] | Sending STOP to tpc
+2021-05-03 15:32:41 | [ERROR] | tpc hasn't ack'd its last stop,
+  let's not flog a dead horse
+\end{verbatim}
+
+The horse reference is from Section~\ref{sec:horseflogging}.
+You should see the problem.
+The most recent STOP issued to the TPC, given above, hadn't been fully acknowledged, and so the dispatcher was unwilling to flog the horse.
+The dispatcher didn't know that this command couldn't be fully acknowledged.
+Anyway, this continued on for quite some time.
+As far as the dispatcher could tell, the TPC wasn't responding to commands, so it wasn't going to issue any new ones.
+
+\section{Part 2}
+
+At 15:54, Joran ctrl-c'd \texttt{reader0\_reader\_0}.
+\begin{verbatim}
+2021-05-03 15:54:23 | [DEBUG] | reader0_reader_0 last reported
+  11 sec ago
+\end{verbatim}
+Normally, if one host times out, the logic proceeds as follows.
+First, a STOP is issued.
+The host timing out doesn't acknowledge this, because it's timing out.
+If it hasn't acknowledged the command for about 20~seconds, the dispatcher asks the hypervisor to fix the problem.
+You probably see the issue.
+The dispatcher couldn't issue the STOP, so it couldn't go un-acknowledged, and the host couldn't get restarted.
+
+Some time later, something did happen.
+\begin{verbatim}
+2021-05-03 16:09:04 | [DEBUG] | reader0_reader_0 last reported
+  892 sec ago
+2021-05-03 16:09:04 | [DEBUG] | reader0_reader_0 hasn't ackd a
+  command from 21 sec ago
+2021-05-03 16:09:04 | [INFO]  | Restarting reader0_reader_0
+2021-05-03 16:09:04 | [INFO]  | Killing reader0_reader_0
+2021-05-03 16:09:05 | [DEBUG] | No screen session found.
+2021-05-03 16:09:05 | [ERROR] | Error killing reader0_reader_0?
+2021-05-03 16:09:10 | [INFO]  | Starting reader0_reader_0
+\end{verbatim}
+What the logs don't show, is that I bypassed the dispatcher and issued a STOP directly to \texttt{reader0\_reader\_0}.
+Now there was an unacknowledged command, and the hypervisor got involved as it normally should.
+This didn't fix the underlying problem of the unacknowledged STOP, which we didn't know about yet, and I hadn't included the \texttt{detector} field in the document.
+Anyway, after the hypervisor action the TPC was now in the \texttt{UNKNOWN} state, which was handled by different logic from the \texttt{TIMEOUT} state.
+The \texttt{UNKNOWN} logic checks to see what command was most recently issued to the detector in question, and if we're still in the timeout period after this.
+If this function gets called enough times and nothing seems to be happening, the dispatcher escalates.
+
+\section{Part 3}
+
+\begin{verbatim}
+2021-05-03 16:09:38 | [DEBUG]    | Checking the tpc timeouts
+2021-05-03 16:09:38 | [CRITICAL] | There's only one way to be
+  sure
+2021-05-03 16:09:38 | [DEBUG]    | Sending STOP to tpc
+2021-05-03 16:09:38 | [ERROR]    | tpc hasn't ack'd its last stop,
+  let's not flog a dead horse
+2021-05-03 16:09:38 | [DEBUG]    | Queued stop for tpc
+2021-05-03 16:09:38 | [CRITICAL] | Hypervisor invoking the
+  tactical nuclear option
+\end{verbatim}
+A couple of things worth noting, here.
+A STOP is queued for the TPC, because this command is \texttt{force}d, which bypasses things like the flogging check.
+The tactical nuclear option is invoked because the dispatcher doesn't know what else to do.
+In the majority of cases, the system behaves as normal following a nuclear strike.
+As it turns out, we managed to crash one of the digitizers in the process, so one of the readers wasn't able to arm, putting the TPC back into \texttt{UNKNOWN} territory.
+\begin{verbatim}
+2021-05-03 16:11:23 | [DEBUG] | The tpc should be ACTIVE and is
+  UNKNOWN (18159)
+2021-05-03 16:11:23 | [DEBUG] | The muon_veto should be INACTIVE
+  and is IDLE
+2021-05-03 16:11:23 | [DEBUG] | The neutron_veto should be
+  INACTIVE and is IDLE
+2021-05-03 16:11:23 | [DEBUG] | Linking: tpc-mv: False,
+  tpc-nv: False, mv-nv: False
+2021-05-03 16:11:23 | [INFO]  | The status of tpc is unknown,
+  check timeouts
+2021-05-03 16:11:23 | [DEBUG] | Checking the tpc timeouts
+2021-05-03 16:11:23 | [DEBUG] | Nuclear timeout at 10/1800
+\end{verbatim}
+This continued for a while, until the readout was stopped and the crates manually cycled to fix the crashing digitizer. Eventually at 16:22 the data-taking resumed.
+
+\section{Post-mortem}
+
+Three people spent the better part of an hour and a half reconstructing this sequence of events.
+One of these was the primary developer of the dispatcher and hypervisor, and the other two had made very significant contributions to both and were very familiar with how the two softwares function.
+A more qualified group on this topic could not be found.
+There was subtlety and nuance involved in the process that no one had anticipated.
+There are edge cases and situations in the dispatcher logic that are still unexplored, and failure states yet to be conceived of.
+
+A number of decision were made as a result of this.
+First, the dispatcher should have some protections against garbage-in-garbage-out, because that was the fundamental cause.
+The original design had assumed that there were sufficient checks in the website to prevent garbage input on that vector, and that the ``experts'' making direct inputs knew what they were doing.
+Well, the joke's on me here, because some of the people with back-end access couldn't be trusted to follow very clear and explicit instructions.
+The dispatcher was modified to make separate checks to ensure that commands were being issued to hosts that actually existed (ie, were already known to the dispatcher), and to be more restrictive about checking to see if commands had been acknowledged.
+If an acknowledgement check is being done for the TPC, and the last command was issued in a linked configuration, we shouldn't care that a veto hasn't acknowledged its commands.
+A nonresponsive veto shouldn't affect the ability of the TPC, this is the whole point of them being independent.
+
+Further, additional logging calls were added to the timeout-evaluating logic to make is much clearer why certain checks were being made.
+There are two reasons why the nuclear option can be considered, and the logs do not contain sufficient information to determine which one was being used here.
+Some educated guesses can be made, but the purpose of logs is to contain sufficient information so that you don't have to guess.
+
+Also, an option to manually use the hypervisor's nuclear option was added, for situations where the dispatcher wishes to deploy it, but is otherwise unable to.

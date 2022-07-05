@@ -1,0 +1,115 @@
+
+\chapter{Computing, but not that kind}
+
+This chapter concerns itself largely with the underground server infrastructure - that is, the readers and eventbuilders.
+The main thrust is a discussion of what kinds of requirements these two kinds of servers have, given the hindsight of already having spent a lot of money on them.
+We'll also discuss storage.
+
+\section{Readers}
+
+The readers are the servers responsible for pulling data from digitizers, reformatting this, and pushing it somewhere else.
+Normally, ``somewhere else'' means disk, but it could mean a database, or a Kafka queue, or whatever.
+It's somewhere that isn't in the readout software anymore.
+
+The main readers for nT are 3 beefy Fujitsu servers, 2x8 core Intel Xeon Silver 4110s with hyperthreading (32 threads total), and 192~GB of memory.
+In some ways this is overkill and in others not enough.
+Readout is a CPU-limited exercise, not a memory-limited one.
+The maximum rate we achieved was 250~MB/s on one server.
+If we buffer two standard chunks (about 11~seconds), this means about 2.5~GB of data sits around in memory, spread across all threads.
+Let's double that to account for the extra space needed for output buffers (this is generous by a factor of two, for the record, because only one chunk at a time is sent for compression and output), so 5~GB.
+Let's make this even worse - a single server can have up to 8 optical links, each maxing out at 80~MB/s.
+The same 11~seconds of buffering means 7 GB, or 14 if we account for the space needed for output (closer to 11 if we're realistic about it).
+Sure, you can increase the amount of data you buffer to one or two minutes, but there's no actual reason to do this.
+Therefore, memory is not what drives the performance requirements for readout.
+
+It's CPUs.
+If you have the maximum complement of 8 optical links, this means you need 8 threads to read them out.
+This leaves 24 threads for all the processing, and all the overhead.
+If you're hosting Ceph on the readers, Ceph takes CPU time as well.
+The OS occasionally also wants some CPU time.
+So, realistically, you can allocate 20 threads to data reformatting and compression, and these 20 need to be capable of 30~MB/s of processing and compression.
+This is probably doable, but I doubt redax is ``optimal'' here, so if you have more cores you have fewer problems.
+AMD offers their Epyc datacenter-line of CPUs with up to 64 cores per chip (not to mention a very generous amount of L3), which is much better for the task of readout than the 4110s.
+Data processing at the readout level parallelizes trivially without increasing memory requirements, so having access to more cores is of great benefit.
+
+\section{Eventbuilders}
+
+The eventbuilders (or ebs) are the servers responsible for the live processing of all data coming from the readers.
+These have very different performance requirements.
+For strax, each thread needs as much memory as each other thread.
+At the readout, you take however much data is coming in and farm it out into however many threads you use for reformatting it.
+At the strax level, you can't have multiple threads chewing on the same chunk for obvious reasons, so each thread you want to use needs access to at least one uncompressed chunk's worth of memory (plus however much is needed for the output, which can reach a factor of two).
+The readout is highly parallelized, we take the data from however many PMTs we have and split it across however many servers we need.
+The eventbuilders have to rebuild this fragmented data stream into one, so at a very high rate of 600~MB/s and standard 5.5~second chunks, this is over 3~GB of memory per chunk.
+Each thread needs access to at least this much memory, and 192~GB of memory disppears remarkably quickly when you need to allocate 8~GB per thread as you turn \texttt{raw\_records} into \texttt{records}, on top of the often considerable memory necessary for all the libraries you're loading.
+
+For eventbuilders, adding more CPUs also comes with the requirement of additional memory.
+For a given amount of memory, the figure of merit for a given chip is the per-core performance.
+The new ebs each use 2 Intel Xeon Gold 6128s, which perform considerably better than the Xeon E5-2660s in the old ebs, despite having considerably fewer threads.
+
+\section{Storage}
+
+Storage falls under three generic subtypes: the high-speed readout buffer, the medium-speed output buffer for temporary storage until data is passed off to Computing, and low-speed storage for things like software, logs, etc.
+
+\subsection{High-speed storage}
+
+SSDs are the only disk-based option here, because you're pushing hundreds of megabytes per second into and out of them at the same time.
+A bank of SSDs in a Ceph deployment is a great way to have a high-speed buffer.
+These SSDs should probably be write-resilient, because a 10~TB buffer will get fully overwritten in a couple of hours under a particularly heavy load.
+Also, under traditional use, replication isn't necessary.
+If a disk dies, you lose that run.
+Meh.
+You shouldn't have a lot of data sitting around unprocessed on this disk because that's not this disk's job.
+Adding replication slows down the writing and reading, and that kinda defeats the point of short-term high-speed storage.
+
+\subsection{Medium-speed storage}
+
+These are the disks where the processed data are stored while the handoff to Computing is happening.
+HDDs are fine, rack up a couple of them in RAID-5.
+Or, deploy all of the eb disks as another Ceph.
+This has the advantage that pushing data above-ground is considerably faster, because NFS is slow but Ceph isn't.
+You can individually NFS however many RAIDs you have, but NFS will only do 1~Gb, and Ceph will do whatever your disks can.
+Also, you don't really need to know \emph{which} eb is physically hosting a given run, and overall you use fewer disks for parity, giving a greater storage efficiency.
+However, if a server goes down then the entire disk goes with it.
+
+\subsection{Low-speed storage}
+
+You also need one disk somewhere on which you host things like logs, common software, maybe home directories, etc.
+Putting all the logging into one central location isn't necessary, but it's \emph{really} convenient.
+Same reason for the software, you can deploy your repo separately to all servers, but having one makes things easy.
+(You still need one deployment per server on locally-mounted storage to keep systemd happy, but these deployments don't need to be kept particularly up to date unless you make very frequent changes to the service files themselves.)
+This doesn't need to be fast, because if you're logging faster than NFS you have other problems.
+It also doesn't need to be particularly large.
+Logging runs maybe a few hundred megabytes per day, it takes years to accumulate a terabyte, and logs are traditionally really squishy.
+
+\section{Servers that aren't EBs or readers}
+
+It's very convenient to have a server or two running a variety of auxiliary and supporting tasks, that are neither a reader nor an eb.
+You need to host your central database ``locally'', so external network interruptions don't bring the whole system down.
+You can replicate it to wherever you want, but there should be an uninterruptable connection from your UG cluster to the database.
+It doesn't also need to be UG unless your UG-AG connection is occasionally unreliable.
+You also need a server to host the control website, and whatever other websites you want running locally at the lab.
+You also need a server to host a variety of supporting scripts, like the dispatcher (see Section~\ref{sec:dispatcher}), any data management daemons, etc, see Chapter~\ref{ch:scripts}.
+(Side note: you're going to need an SSL certificate for your website server.
+I used letsencrypt for simplicity, but there was one problem where expired certificates kept getting served?
+Don't know or understand, but easily fixable by just renaming expired files.)
+It's also really convenient to have an analysis-capable server that doesn't usually participate in the regular live processing.
+Sometimes you need to do some analysis underground.
+Analysis?
+On \emph{my} UG servers?
+It's more likely than you think, maybe you need to dig into the reader data or raw records or something.
+It doesn't necessarily need to be equivalent to the heavy-lifting ebs, but it should be able to hold its own.
+
+There is some nuance with regards to assigning tasks to servers.
+You don't want to do analysis on the servers that host the database, because the database needs priority access to system resources or else it doesn't respond fast enough.
+You don't want the database processes to be trying to access swapped information.
+If you are particularly imprudent in your analysis you can bring down the server, and this can cause some nonsense with the database organization.
+Better to have the analysis server be its own thing, and then you can use the databse server to host the website, your extra scripts and daemons, etc, because none of these are particularly ``heavy'' tasks.
+
+You want a distinction between these ``auxiliary'' servers and the ``worker'' servers (readers and ebs) for a couple of reasons.
+Readers can potentially hard-crash due to a bug (feature?) in the A3818 driver where it sends a kernel-panic if it's interrupted while it's actively pulling from a board.
+When this happens you have to reboot the machine.
+The ebs are usually going to be busy with some processing task, and processing is rather memory-intensive.
+It's not uncommon to max out both the memory and swap, and this usually means bad things for anything else running on that machine.
+The UG analysis server can be of a similar build to the ebs because they're doing similar things, if you happen to have one with a broken RAID controller, this actually works out really well.
+It doesn't need to be as generously apportioned as the ``main'' ebs, but don't skimp too much on its resources.

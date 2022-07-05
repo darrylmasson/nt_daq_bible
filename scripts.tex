@@ -1,0 +1,318 @@
+\chapter{Other softwares}\label{ch:scripts}
+
+A variety of supporting scripts are necessary to operate a system like this.
+In this chapter we'll discuss most of them.
+
+\section{Dispatcher}\label{sec:dispatcher}
+
+The dispatcher is the brain behind the entire system.
+It needs to run independently from everything else, and it needs to be always running.
+We'll start with a general discussion of the things a dispatcher needs to do, and then have a deeper look at the nT dispatcher.
+
+If you're running a system with more than one process (reader and crate controller, readers on multiple servers, two readers on one server (not sure why you'd use this, honestly), etc), then trying to control and coordinate manually becomes a major hassle (even using the super-helpful scripts provided).
+Even for one process after a while it becomes annoying.
+This is the purpose of the dispatcher.
+The dispatcher takes as input a) what the system is currently doing, and b) what the system should be doing, and issues commands to make this happen.
+For a ``simple'' system, this usually isn't too complex.
+For something with the interconnected-ness of XENONnT, it becomes absurd.
+
+The dispatcher that comes with redax is the XENONnT dispatcher.
+There is a 99\% chance that it's far more complex than what you need, so you can either rip random parts out of it, or just write your own.
+Writing your own is probably simpler than trying to figure out if you actually need this complex piece of logic, and we'll go over the various parts here.
+It may be instructive to refer to the nT dispatcher for this discussion.
+
+To prevent some potential ambiguity, I often use ``process'' and ``host'' interchangably - while you can run multiple readout processes on the same physical server, there's no real reason to do so.
+There's a slight performance penalty because of overhead threads, and the database will take slightly longer to query because it has to sift through more documents.
+When a distinction is necessary I'll probably refer to a ``physical host'' to mean the actual server any processes run on.
+
+\subsection{What is the system currently doing?}
+
+This stage turns the various statuses of the hosts attached to a detector into a single aggregate status for that detector.
+If you only have one host, then the aggregate system status is obvious.
+If you have multiple hosts, this can be rather more complicated.
+If all the hosts have the same status, it's simple.
+What if one host is `arming' and another is `armed'?
+
+In this step, you should collect the most recent status documents from each host (\texttt{MongoConnect.get\_update}) and figure out what the combination of \texttt{status} fields mean (\texttt{MongoConnect.aggregate\_status}).
+While you're at it, you can add up the \texttt{rate} and \texttt{buffer\_size} fields and do whatever you want with the routine status update information.
+Have all the hosts reported in recently, or is one timing out?
+Redax will never report a TIMEOUT or UNKNOWN status; these are higher level ``meta'' statuses, and the dispatcher needs to assign these (at least TIMEOUT) when appropriate.
+
+When it comes to the actual aggregation, there are broadly two kinds of statuses: ``or'' statuses and ``and'' statuses.
+``Or'' statuses are things like ``timeout'' or ``error'' - if any one host has this status, the whole detector has this status.
+``And'' statuses are things like ``running'' - if all the hosts are running, then the whole detector is running.
+Figuring out which statuses are ``or'' and which are ``and'' is subject to debate.
+For nT I settled on the ``or'' statuses as `ARMING', `ERROR', `TIMEOUT', and `UNKNOWN', and ``and'' as `IDLE', `ARMED', and `RUNNING'.
+You could make a case that `ARMING' should be an ``and'' status, and in principle yes, but in practice no.
+The crate controller arms in a couple of milliseconds, so it's unlikely that a status update will happen during this short period.
+Thus, the dispatcher will only ever see this host go from IDLE to ARMED.
+The readers take at least 3 seconds to arm, usually up to 15 or 20 seconds depending on how long the baseline routine takes, so you'll always see a couple of status updates during the arming sequence.
+So unless you want to code the logic to deal with the CC being ARMED while the readers are still ARMING, leave it like it is.
+
+One additional consideration here: if you have multiple hosts, are all of them \emph{supposed} to be doing something?
+Maybe you're using a run config that doesn't need all hosts you have.
+Before the aggregate step, you may want to filter which hosts are actually being considered to only those that are supposed to be participating in whatever the detector is supposed to be doing.
+If you have a crate controller, then this is probably always going to be participating, so you can use the \texttt{mode} that it reports and only look at the processes that are required for that config.
+If you don't have a crate controller, it'll be a bit more complex, but then you probably aren't running a complex system.
+
+\subsection{What should the system be doing?}
+
+This should be pretty straightforward.
+You can have a collection with one document per detector that contains all the necessary information (if it should be on or off, what mode, etc).
+Alternately, you can store these things individually and aggregate them when you need them.
+The advantage of the second is that changes are easier to track (also more compactly), but the first is easier to maintain.
+See \texttt{MongoConnect.get\_wanted\_state} for redax $\geq$ v2 or v1 for a comparison.
+
+\subsection{Make it so}
+
+This is where the magic happens.
+You have the two necessary inputs, now you need to issue commands to turn one into the other.
+You can largely divide this into two cases - if the detector is supposed to be on or off.
+The ``off'' case is simple - if the detector isn't off, send a STOP command (unless you just sent one recently).
+The ``on'' case is rather less simple.
+Going from ``on'' to ``off'' is a one-step process.
+It may take a few seconds (probably should if you have a crate controller), but you issue STOP and in a few seconds it'll have happened.
+Going from ``off'' to ``on'' takes longer.
+First you issue the ARM command, then you have to wait for all the hosts to go through the arming sequence and end up in the ARMED state, and only then can you issue the START command.
+You don't want to issue commands if hosts aren't in a position to act on them immediately, because then they'll act on them at ``random'' times and serve to confuse the system.
+Let's look at this in more depth.
+
+\subsubsection{Starting}
+
+Going from IDLE to ARMED is straightforward - issue an ARM command to all necessary hosts.
+Going from ARMED to RUNNING is also straightforward - issue a START command.
+You don't need to worry about timing for a ``large'' setup involving a crate controller, because at the end of the arming sequence the boards are all ready to go.
+The START command doesn't actually do anything to the readers other than change what status they report; all the threads are created in the arming sequence and are just waiting for data to start showing up.
+
+\subsubsection{Stopping}
+
+Going from RUNNING to IDLE takes a bit more subtlety.
+When the readers get the STOP command, they immediately do exactly that.
+They stop reading from the digitizers, finish processing whatever is still in the queue, and start destructing objects.
+You want to make sure that this happens after data has stopped flowing.
+We issue a STOP command to the CC 5 seconds before it goes to the readers, because this gives the readers enough time to finish everything before they stop.
+For a lower readout rate, 5 seconds is being very generous, however you also have to consider this value relative to the command polling frequency.
+The default value here is \SI{100}{\milli\second}, but in the past it's varied from \SI{1}{\milli\second} (typo) to \SI{1}{\second}.
+If the readout rate is ``low'', a 1 second difference is fine, but if your poll frequency is only 1 second, you can run into the case where the CC gets the command a handful of milliseconds before a reader, and this is dangerous because you might lose data.
+
+\subsubsection{UNKNOWN}
+
+UNKNOWN is expected when the detector is transitioning and the hosts don't all have the same status, so as long as the system hasn't been UNKNOWN for too long it's probably fine.
+If this shows up, the action to take is to see how recently a command was issued, and if the time since then is reasonable.
+
+\subsubsection{TIMEOUT}
+
+TIMEOUT seems straightforward - as long as you can figure out what exactly is timing out.
+Generally this means one process (or physical host) has crashed, but because mutexes this is only the most common cause.
+The stopping sequence locks a mutex, so you have a massive data backlog when a STOP comes through the status updating thread has to wait until it can lock that mutex (it's necessary), so it'll look like that host is timing out even though it's perfectly fine and will return to normal ``soon''.
+This is much less common than in the past due to redax' load-balancing between processing threads, so it's very difficult for one thread to get hold of more than its fair share of data.
+Also, redax is quite fast, in the 5 seconds between the end of new data and the request to stop, a given host should be capable of chewing through over a gigabyte.
+Anyway, what was the detector supposed to be doing when it timed out?
+Are we still in the timeout period after issuing a command?
+These considerations require some subtlety to handle properly.
+
+
+\subsection{Other considerations}
+
+The above are more or less the minimum requirements for a dispatcher.
+There are, naturally, more things a dispatcher can do.
+
+\subsubsection{Rundocs}
+
+The dispatcher can also be responsible for building the run document and inserting it into your runs database.
+The rundoc should probably contain a complete copy of the options that the readers/cc are going to load, so you can refer to it later.
+
+\subsubsection{Run start and stop times}
+
+Often it's desirable to know ``exactly'' when a run started or stopped.
+If you have a crate controller, this will be based on when it sends or stops the S-IN signal.
+Redax tracks when the CC process receives and acknowledges commands; the START command takes maybe \SI{100}{\micro\second} to process; STOP takes about \SI{2}{\milli\second} because it also has to destroy a bunch of objects.
+This gives timestamps accurate to within \SI{100}{\micro\second} of NTP time (ideally), which is perfectly fine for a TPC with a \SI{1}{\milli\second} drift length (or, if your TPC happens to be broken, more than \SI{2}{\milli\second}.
+More practically it's probably quite some milliseconds.
+
+The run stop time also is a bit nuanced in situations where things aren't strictly going to plan, but this largely comes down to exactly how you set the run end-time.
+If you do it whenever you issue a STOP, you'll likely run into edge cases where you issue run end-times incorrectly if detectors are misbehaving.
+A lot of this is down to the implementation details.
+
+\subsubsection{Soft stop}
+
+This is a quality-of-life feature that gives another option regarding stopping an active detector.
+Rather than stop ``now'', it waits until the active run is finished and then issues the STOP.
+
+\subsubsection{Kicking it while it's down, or flogging a dead horse}~\ref{sec:horseflogging}
+
+This metaphor combination covers two broad things.
+The first is about issuing commands too quickly.
+The system takes some time to respond, the arming and stopping sequences for instance take several seconds each.
+The infamous \texttt{sleep(2)} exists because doing things too quickly is a great way to cause crashes.
+It's not a bad idea to let the system sit for a few seconds between ending one run and starting the next.
+What's the rush?
+An extra 3 seconds idle out of an hour doesn't really change anything.
+Let the system respond properly to something before trying to get it to do something else.
+
+The second metaphor relates much more to handling timeouts.
+Usually, if a host is timing out, it also isn't acknowledging new commands.
+You can queue up a bunch of STOPs because that's kinda the only thing the dispatcher can do, but there's no difference between one un-ack'd STOP and twenty.
+A smart dispatcher would check this first rather than queueing up however many STOPs that the poor host will have to wade through when it comes back up.
+
+\subsubsection{Error reporting}
+
+At some point the dispatcher will need to either call for help or let someone know that something isn't going according to plan.
+This is where you need some method of reporting errors.
+You don't want to fill up your database with ``trivial'' messages, so these can get written to the logfiles.
+Also, if the detector is acting up (usually timing out in some way - either a host is timing out or it took too long to arm or something), you probably want to issue a message, but not on every update cycle, so you want some kind of backing-off mechanism.
+When the issue is cleared, you want this to be reset so you can catch the next error easily.
+
+\subsection{nT dispatcher}
+
+I'll not beat around the bush.
+The logic supporting a fully-featured dispatcher like what we use for nT is \emph{terrifyingly} complex, with a depth of subtle nuance that you'll probably never fully plumb.
+Rather than describe it all here, I'll instead include an entire chapter where we go through a bug, and hopefully that'll give you a better idea of how it all works.
+See Chapter~\ref{ch:bugreport}.
+
+\subsubsection{Linked mode}
+
+One of the limitations of the 1T DAQ was that there was no real connection between the TPC and MV readouts.
+The TPC clock was propagated to the MV, but they could very easily have run on their own clocks without impacting anything.
+The MV trigger signal was sent to the TPC AM, and that was the extent of it.
+The MV run numbering was different, and almost no one ever looked at the MV data.
+For nT it was decided that a much closer connection between the detectors was desired, with the option to run them all actually together with a combined data stream and a combined clock.
+This way an analyst could look simultaneously at a signal in the TPC, and also any surrounding signals from the vetoes.
+Not just ``did a veto see a signal'', but ``what does the signal in the veto look like''?
+We called this feature ``linked mode''.
+
+Implementing this in the control software (website and dispatcher) turned out to be complicated.
+Initially the website had buttons labeled \texttt{link\_mv} and \texttt{link\_nv}, but linked two detectors is about more than just pushing a button.
+If they're set to use different run modes, this doesn't make sense.
+If neither are set to use a mode compatible with linked operation, this also doesn't make sense.
+This wasn't too difficult to implement, though.
+The hard part is the control logic that makes this happen.
+
+\subsubsection{Physical and Logical detectors}
+
+The initial way linked mode was implemented was with massively convoluted logic and lots of booleans that looked like \texttt{if is\_active(`tpc') and is\_linked(`tpc', `muon\_veto') and not is\_active(`muon\_veto')}, and was generally very difficult to follow.
+For the dispatcher v4 we replaced this by making a differentiation between ``physical'' detectors (the TPC and the two vetoes) and ``logical'' detectors (ie, whichever detectors were linked together that the logic could treat as a single entity).
+Logical detectors are independently controlled.
+If two detectors are linked together, they are no longer treated as separate, independent detectors, but as one ``super detector''.
+This was an idea that started development around six months after the start of commissioning.
+We were finding new bugs in the logic sequence all the time, and we hadn't yet touched linked mode.
+The logic concerning linked operation was a royal and convoluted mess, and we were finding subtle errors in much simpler sets of booleans.
+There was very little confidence that the linked-mode checks would actually function as desired.
+So, rather than spend an unknown amount of time trying to debug very convoluted logic, we introduced a distinction between physical and logical detectors.
+This \emph{massively} simplifies the logic, and comes with the additional benefit of enabling linked modes not previously considered, namely, the two vetoes linking together without the TPC.
+They aren't cabled to support this, but that's not the problem of the dispatcher.
+Additionally, this generalizes the dispatcher for the (unlikely) situation where a fourth detector is added to the system, where only one function needs updating to account for the additional potential linking cases.
+
+Some additional bookkeeping is necessary, because the front-end reporting must still be done using physical detectors.
+The typical rate for the MV is $<1\,\mathrm{MB/s}$, and you won't notice if this goes missing from the 50~MB/s of the TPC.
+Also you want to list physical detectors in the rundocs.
+None of these things are complicated, but they need to be remembered and handled correctly.
+
+\section{Hypervisor}\label{sec:hypervisor}
+
+The hypervisor is the dispatcher's enforcer.
+A process has crashed and is timing out?
+Restart it.
+We haven't been able to arm after a couple of failed attempts?
+A digitizer probably crashed, cycle the VME crates and all the processes.
+This turned out to be \emph{so phenomally} successful people from outside the DAQ group commented on how great it was.
+
+\subsection{Version 1}
+
+This version was hacked together in a few hours one Christmas Eve, because the Operations group couldn't organize anything properly and insisted on doing a bunch of things that cause stability issues, right up to when the lab closed down for Christmas, and then constantly complained when their problem-causing actions caused problems.
+It wasn't particularly fancy.
+Every 10 minutes it would check to see if the DAQ was running sometime within the last 10 minutes.
+If yes, there was nothing to do.
+If no, cycle everything.
+There was no provision for first checking to see if the DAQ was supposed to be running or not.
+If it wasn't running, it was made to run.
+One process crashed?
+Cycle all the VME crates, cycle all the processes.
+It was a bit extreme in its approach, but I was officially on holiday when I wrote this version, and my reward for all the things I did over this holiday was a bottle of scotch I specifically don't like.
+
+\subsection{Version 2}
+
+This one was much smarter, it also checked if the DAQ was supposed to be running before it did something.
+It also had a more intelligent approach to fixing the problems, and combined almost everything into one file rather than having a bash script that called various python scripts.
+It still deployed the ``nuclear'' option regardless of what the problem actually was, but it was a bit smarter about how the nuclear option was used.
+A few issues lingered, specifically no problems would be fixed if the DAQ was not set to ON.
+Also a wide variety of typos were only discovered after deployment, but fortunately these didn't go unnoticed for very long (mainly because these typos usually meant that nothing happened, rather than the desired fixing of the readout).
+
+\subsection{Version 3}
+
+This was the first release that ``fully'' realized the hypervisor's potential.
+The hypervisor was never intended to be its own independent process, because there is considerable overlap between what the hypervisor is supposed to do (ie, make sure the DAQ can run) and what the dispatcher is supposed to do (ie, make sure the DAQ is doing what its told to).
+The dispatcher already has very complex logic to figure out what exactly the system is currently doing, it's really hard to motivate duplicating all this again into an independent hypervisor.
+Rather, let the dispatcher make the decisions about when a process should be restarted, and let the hypervisor be the tool that allows the dispatcher to do it.
+The nuclear option is only invoked when it's necessary, it is no longer the first option.
+It's beautiful, it's so responsive that you have to be watching \emph{really} closely to notice when it fixed problems.
+All problems are fixed within 5 minutes.
+
+\subsection{Version 4}
+
+Once we started running in linked mode, a new type of problem started showing up.
+The NV would stop responding for some reason, so the dispatcher would see that the ``logical'' TPC (which included the MV and NV) wasn't responding, and the nuclear option would be invoked.
+This obviously wouldn't fix the problem, because the nuclear option didn't affect either veto.
+This frequently caused issues rather than fixing them.
+If a savvy operator was fast enough, they could unlink the offending detector before the warheads started flying and the system would resume otherwise normal operation, leaving the NV until an expert was available to fix it.
+However, if this happens in the small hours of the morning, it won't be caught by a savvy operator and so the entire readout of all three detectors goes down because the NV couldn't pull its weight.
+This is actually a problem, because with the advent of occasional hotspots, the DAQ because safety-relevant, and therefore uptime becomes rather more important.
+
+Is the ideal solution to give the HV control over both veto detectors?
+Of course, but behave yourself.
+The simpler solution is to teach the hypervisor how to unlink detectors.
+This way an offending veto can be left in the ditch it fell into while the remaining detectors carry on by themselves.
+If it turns out that the physical TPC is actually the cause of the problems, then the nuclear option proceedes as it otherwise normally would.
+
+Implementing this required making substantial changes to the hypervisor.
+Up to this point, the HV had never actually changed the desired operational state of the system, or in the much older versions where it actually did, it did so via the API.
+However due to the complexities of ensuring a useable configuration the API cannot be used in conjunction with linked mode operation.
+Therefore, you cannot use a call to the API to put the system into a linked configuration.
+Thus, the HV needed to affect the necessary changes direclty via inserts to the database.
+This isn't technically difficult but still required a couple of new functions and a bit of refactoring.
+
+One result is that the hypervisor now shows up as having started runs.
+As of writing, it has accumulated some \SI{25.5}{\hour} of runtime, which puts it near the middle of the high-score chart.
+Every hour of this runtime is data that would otherwise have been lost because the NV stopped working.
+
+A token effort was made by a member of the NV group to make the HV work for their readout, because this very obviously is a bad look for them.
+This is not a complicated operation, but it does require them to actually make a contribution to the general set of software that supports the readout.
+This, I expect, will never come to pass.
+
+\subsubsection{Known bugs and edge cases}
+
+The hypervisor has one of each.
+The bug is about the automated unlinking as mentioned above.
+This only works if one detector is in a \textit{hard} failure where some of the processes aren't responding.
+\textit{Soft} failures such as if a digitizer won't arm but the processes is fine, fall through the logic.
+The dispatcher tracks a counter for when a detector fails to arm, and invokes the nuclear option when this value reaches some threshold.
+This counter needs to be extended to track physical rather than logical detectors, and made available to the hypervisor.
+
+The edge case also concerns the automated unlinking.
+To achieve this the mode needs to be changed from whatever it is to some specified defaults.
+For instance, \texttt{background\_linked} is changed to things like \texttt{tpc\_mv\_link} and \texttt{tpc\_nv\_link}.
+This only works for background modes, if this becomes necessary in calibration modes then you won't be in a calibration-compatible mode.
+
+\subsubsection{Unknown bugs and edge cases}
+
+If you are expecting actual bugs here then you clearly didn't read the section heading.
+There are bugs and edge cases we haven't found yet.
+This is how it works.
+Nothing this complex will ever be truly bug-free.
+
+\section{Bots}
+
+You can integrate a variety of bots with things like Slack.
+If these bots run UG, they have access to the hottest of data, and can help the Operations team make fast decisions about the current conditions, without waiting for a run to end, be processed, replicated overseas, and made available for general analysis.
+
+\section{Website}
+
+To be entirely honest, I'm not really sure what to say about the website.
+It's a website.
+It's written in NodeJS and is hosted UG.
+It doesn't do anything particularly fancy.
+It's probably the least complex part of the system.
+If you've never done anything with web programming before you'll probably be lost, but that's true of most things.
+There are a lot of resources available to explain how this works, but this is the only document that'll tell you how the other things work.
+Maybe sometime I'll fill out this section.
+Probably not.

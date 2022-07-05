@@ -1,0 +1,37 @@
+\chapter{Other dispatcher bugs}
+
+There were a few other more minor bugs in the dispatcher, so I'll put them here before I forget about them entirely.
+Most of these could be expanded into a lot more, but I think we already have enough of full debriefs.
+I just want some record of these for posterity, so people know the history.
+
+\section{Clock bug}
+
+One morning I woke up to see a bunch of very short runs and general instable performance.
+The dispatcher kept thinking that things were timing out, so it stops the run and tries to fix things.
+This kept going for a several hours.
+
+The root cause was that the system clock on oldmaster was a few seconds ahead of the gateway (which provides the UTC standard timestamps that everything uses).
+When the dispatcher calculates how old documents are, it compares the timestamp in the ObjectID, which is given by the gateway, with the system clock of the machine hosting the dispatcher, which is oldmaster.
+If the clocks aren't close enough then you'll see a difference, and if this difference is large enough (or slowly grows until it is large enough) then the dispatcher will think that processes are timing out.
+
+This was tough to debug, because everything was working and posting documents as normal.
+The symptom was quite clear in hindsight: all the cards on the website were saying ``Last seen 8 seconds ago'' rather than the usual 0 or 1 seconds, because these differences are also calculated from the difference between oldmaster time and gateway time.
+The solution was trivial, resync oldmaster's clock and make sure it regularly syncs itself.
+An alternate solution is to add a thing to the dispatcher where it retrieves ``now'' from the gateway via the database (there is the \texttt{\$currentDate} operator or something like it you could wrap into a \texttt{find\_one\_and\_update}).
+I considered this a few times but never got around to implementing it.
+
+\section{Run number conflicts}
+
+This is also mentioned elsewhere, but it kept showing up occasionally in annoying ways, which highlighted a few things we weren't doing properly.
+The root cause is if two detectors arm simultaneously in an un-linked configuration, because of how we generate run numbers.
+
+This showed up a few times because some of the vetoes were still running an older redax release which had a large delay between when arm commands were received and when they were acted on.
+The dispatcher assumes that if an arm command is issued, in the next logic cycle that detector will report as arming.
+If, for whatever reason, this isn't true, then this problem shows up.
+
+A pernicious case showed up once because the time between the bottom of the logic loop (when commands are issued) and the top of the next loop (when the status is reassessed) was too short.
+The reason it was too short was because the dispatcher was doing too many slow queries, so the time it took to do all the queries more or less equaled the loop time.
+The dispatcher is configured to run with constant cycle rate by accounting for how long each loop takes, because it's more convenient if the timing is regular.
+The culprit queries were the calls checking for unacknowledged commands to each process, which for some reason weren't indexed.
+Using the index sped them up considerably, but we still increased the logic timer by one second, so there's enough dead time between loops to allow for commands issued in this loop to be acted on by the next.
+

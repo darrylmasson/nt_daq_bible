@@ -1,0 +1,77 @@
+
+\chapter{Looking forward}
+
+So based on what we've learned from designing, building, and running the nT DAQ, what would we do differently?
+Or, put differently, how would I design the DARWIN/G3 readout?
+
+\section{High-level organization}
+
+The greater nT DAQ is subdivided into three groups - the ``core''/TPC, the MV, and the NV.
+This ends up being \emph{terrible} because all of the general work will be done by the core group, and the veto groups won't participate in the design or implementation of any of the common systems, so they don't understand how they work.
+The readout software, the website, the control software, the implementation of live processing, the databases, the design of how the full-system integration would work, the veto groups contributed exactly nothing of substance to any of this.
+If there is only one DAQ group (like how Slow Control is organized), they will thank you later.
+You can still have one person inside the DAQ group who is in charge of the various veto readouts, but they shouldn't be their own group.
+The veto groups might complain and say things like how they're going to do all kinds of fun and novel things and other nonsense.
+None of the things they claim will ever come to pass, they'll end up with a system that barely functions and is a real pain to integrate into everything else.
+This isn't a doom-and-gloom prediction, this is history from XENON1T and XENONnT.
+One DAQ group that handles the readout of all the various subdetectors.
+
+\section{Analog electronics}
+
+If you're building custom amplifiers, why put them into NIM form-factors?
+Make them fit into the standard 19'' rack by themselves.
+If you're going to do an analog sum signal, do this on the amplifier boards rather than in a massive array of discrete NIMs.
+You'll need to plan ahead for what kind of attenuation you'll want, but it isn't like you don't know ahead of time what the dynamic range is of your ADCs.
+
+\subsection{HE subsystem}
+
+The high-energy boards were less than spectacularly successful.
+Yes, they do provide better information for signals that saturate the digitizer input, but they don't account for saturation in the PMT bases, and that starts shortly after digitizer saturation.
+A better techinque would be to read out one of the last dynodes from each PMT.
+This is not entirely straightforward, for one you just doubled the number of signal cables, and also you don't want the readout of these intermediate dynodes to affect the signal that shows up at the anode.
+Still, unless you redesign the PMT bases to stay linear at much larger signals, the nT implementation of the HE subsystem was not particularly good.
+
+\section{Digitizers}
+
+Digitizers with only 8 channels won't scale to a system with 2000~PMTs.
+You'll be digitizing a lot of these twice (high- and low-gain), as well.
+The power requirements of V1724s of even V1730s and VME crates for this will be absurd, to say nothing of the amount of rack space.
+One VME crate takes 8U of total space (including cooling fans) and can mount 21 boards, which gives a filling factor of 21 channels/U.
+
+CAEN has two new types of digitizer which are worth looking into.
+The first is the R5560, which is a rack-mount 2U module, with 128 channels, 14 bits, and 125 MS/s, and $\sim1.2\,\mathrm{W/ch}$ (side airflow).
+The other is the V2740, which is a VME board with 64 channels, 16 bits, 125 MS/s, and $1.6\,\mathrm{W/ch}$ (vertical airflow).
+Both have open FPGA, so we can potentially do a lot of things.
+For instance, you could compute the sum waveform on the FPGA, so you wouldn't need the fan cascade, and then the HEV is no longer a single external physical module, but entirely in the digitizer software.
+Same for the busy subsystem, you might not need an external module.
+Maybe you do some dynamic down-sampling of wide signals because you don't need a resolution of \SI{8}{\nano\second} for massive \SI{10}{\micro\second}-wide S2s.
+Maybe you do a radial veto for external calibration sources because you'll never look at those events anyway.
+Point is, you've got a lot of options.
+The overall paradigm of a totally triggerless readout is still the way to go for background data, but there's a lot of room for new ideas when it comes to data reduction during calibration.
+They have ethernet connectors so can plug straight into the switch.
+These modules also have a linux SoC, so it's entirely possible that you don't actually need readers, depending on the capabilities of this chip.
+It's still worth having an intermediate disk and not stream directly from the digitizers into strax, just because the readout has to continue while processing can occasionally pause.
+
+Alternately, go for fully-custom digitizers, but remember that whenever the postdocs and students who designed them leave, you're going to find yourself in a bit of a tough spot if subtle things start showing up.
+
+\subsection{Crate organization}
+
+We could have done better here, and if you're building a new system then here are some suggestions.
+A CAEN VME crate has 21 slots.
+It's useful to have a crate controller and a Vx495 in each crate, for backplane access to each digitizer.
+If you put 16 digitizers in each crate, that's two optical fibers if you're using that for readout, and 1024 channels if you're using 64-channel boards.
+The ribbon cables we use for the LVDS lines have a set number of cables (32 or 34? I forget), and running multiples of these around is really inconvenient so doing the BUSy aggregation crate-by-crate is going to make things much simpler.
+Aggregating BUSY states via a logic fan or something between all the Vx495 is pretty trivial.
+I would also put a clock distribution module into each VME crate, as well as the logic fans for that crate.
+This will make the digital cabling much simpler to work with.
+One crate controller will still act as the ``master'' by issuing the definitive S-IN signal, but you would have access to the outputs of all of them which could be useful for something.
+
+\subsection{Channel muxing}
+
+One question that should be investigated is whether all the top array PMTs actually need to be individually read out.
+Is it possible to combine channels in such a way that you don't impact S2 position reconstruction?
+For energy reconstruction it's moot because this is always done with the bottom PMTs, but in principle channel muxing could also be applied to the bottom array.
+If this can be done effectively, then a smaller number of readout channels can be used, which saves on the cost of equipment and also data storage.
+There is nuance to this with regards to what you do with the PMTs themselves, but that's not a DAQ problem.
+
+(Addendum: this is possible and not actually that difficult.)

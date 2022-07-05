@@ -1,32 +1,44 @@
-\documentclass[a4paper, 12pt]{report}
+\documentclass[a4paper,12pt]{report}
+%\documentclass[a4paper,12pt,draft]{report}
 \usepackage{amsmath}
 \usepackage{graphicx}
-\usepackage{glossaries}
 \usepackage{hyperref}
 \usepackage{siunitx}
+%\usepackage[toc]{glossaries}
 
 %\input{defs}
 
 %\affiliation{Universitaet Freiburg}
 
-\includeonly{introduction}
+%\includeonly{introduction}
 
 \begin{document}
-\title{XENONnT DAQ documentation}
+\title{XENONnT DAQ commentary, v0.1}
 \author{Darryl Masson}
 \maketitle
+\tableofcontents
 
 \include{introduction}
 
-\include{digitizers}
+\include{overview}
 
-\include{layout}
+\include{digitizers}
 
 \include{computing}
 
 \include{redax}
 
+\include{scripts}
+
 \include{bootstrax}
+
+\include{dispatcherbug}
+
+\include{otherdispatcherbug}
+
+\include{overlapbug}
+
+\include{future}
 
 \bibliography{main}
 

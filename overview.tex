@@ -1,0 +1,143 @@
+
+\chapter{XENONnT DAQ Overview}
+
+This is not the same as the DAQ paper (\url[wiki]{https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:org:papers:ntdaq}), but it will probably help if you're familiar with it.
+Many of the (sub)sections here have their own chapters, but we'll discuss them here briefly in a broader scope.
+
+\section{Analog electronics}
+
+The first step and the one with the most significant impact on noise is the first stage amplification and cable routing.
+It should go without saying that you use low-noise amplifiers, especially for the high-gain output.
+The low-gain output is a bit more noise-resistant, because you can raise the trigger threshold on these channels with no impact on the efficacy of the data.
+Looking for large signals does make some things easier.
+
+A brief rant on cable routing: if at all possible in any way, don't let a non-expert do it.
+Non-experts probably don't understand noise pickup, or routing the cables in a nice and orderly fashion.
+It'll probably be an eyesore, pick up all kinds of noise, and keep you awake at night.
+If there is some kind of apocalypse or global pandemic or something and you aren't able to do it yourself, you'll want to supervise the process very closely, because otherwise it'll be chaos and you'll never be able to properly fix it.
+The ``no, run that bundle on the other side of that bracket'' kind of supervision.
+There's a limit to the things you can fix after the fact without redoing everything.
+
+\subsection{Amplifiers}
+
+The dual-gain amplifiers are great.
+The same x10 output for the low-energy signals, and the 0.5x output for the high-energy signals.
+The SMB connectors are much better than LEMO, except that the amplifiers have male connectors, which is unusual.
+Typically cables have the male connector, and the things you plug cables into have female connectors.
+Usually the male connector breaks first, and it's much simpler if you just replace the cable and not a whole amplifier section.
+
+\subsection{Fan cascade}
+
+The sum waveform from the bottom array is used in two important places: the acquisition monitor and the high-energy veto.
+The HEV is needed to keep the data rate low during calibration.
+The sum waveform is needed to keep the acquisition monitor working properly.
+It's the signal that makes sure we track clock rollovers properly, because the BUSYs and VETOs don't happen often enough.
+The problem is that summing up 240 signals, each at a relative amplitude of 1/20, means that you end up with something that's effectively 12x amplified when compared to the ``usual'' low-energy signals.
+Extra attenuation is necessary.
+
+We ended up using a 30x attenuator because it was available, but 20x might have been nicer.
+This ended up causing some issues during commissioning, when they wanted to collect krypton data before filling the water tank, so they wanted the HEV to veto S1s larger than krypton.
+With poor purity, ``large'' S1s are maybe a few thousand PE spread over 250 channels, then attenuated by a factor of 600, so you end up with maybe a 6~PE equivalent signal.
+This is for $^{208}\mathrm{Tl}$, smaller stuff is basically invisible at this scale.
+Calculating shape parameters on a signal this small is difficult, not only because the software was intended to identify large S2s, but also because the average S1 often doesn't last long enough for the hardware to actually compute things in time.
+
+Having a few more options available for attenuation would be nice, maybe build them into a linear fan.
+Run the numbers first to figure out what size of signal you're going to be dealing with.
+Also, it's very easy to get a lot of noise on the output of the fan cascade, and this will play havoc with a lot of things.
+
+\section{Digital electronics}
+
+\subsection{VME modules}
+
+Most of the VME boards are going to be digitizers, but you'll also need a crate controller and a logic board.
+You'll have to distribute these among the VME crates carefully, because it turns out that a full crate of digitizers draws more power than the usual power supply can provide.
+
+\subsection{Fans}
+
+Fans are how you take the single S-IN signal from the crate controller and distributed it to 95 digitizers.
+If you're lucky you can get 1x32 fans, meaning you only need 3.
+If you're unlucky then the company will ghost you when you try to order them, and you have to resort to 1x16 fans, in which case you need 6.
+Well, 7 really, because you need to first distribute the one signal into however many other amplifiers you're using.
+
+You also need two sets of logic fans, one for the S-IN signal and one for the trigger/veto signal.
+
+Also, test every output on every fan to make sure they work.
+Some of them might be older than you are, and figuring out which ones don't work properly before you install them will make things easier.
+You don't want to swap two digitizers out because they aren't responding properly, only for it to turn out that the digitizers weren't the problem.
+
+\subsection{Not fans}
+
+A handful of other NIM modules are necessary for specific things.
+You need a gate to implement the control of whether or not you send signals to other parts of the wider DAQ system.
+You are probably also going to need a NIM-TTL converter and a dual-gate generator as part of the interface with the LED pulser, the converter because the LED pulser doesn't understand NIM logic, and the gate generator as the delay module to make aligning the two systems easier.
+
+Also, there's the master clock module and the DDC10 mounted on a shelf somewhere.
+
+\subsection{Busy/Veto}\label{sec:busyveto}
+
+Sometimes a digitizer goes busy.
+They only have a few milliseconds of memory per channel, it's surprisingly easy to fill when your drift length and memory length differ by a factor of only a few, rather than orders of magnitude.
+Adding more memory isn't a fool-proof solution (looking at you, PandaX), because there's always a type of event or condition or something that'll fill whatever memory you have.
+You have to have a solution of dealing with busy digitizers that has no edge cases.
+It's vitally important to know when boards go busy, because it means your system isn't reading out data properly for a brief interval.
+Any events that happen ``near'' such a time are very suspicious, because you don't know what you aren't seeing.
+Was that S1 actually larger by a few photons?
+Was there actually another S1 or S2 that's hidden because the system couldn't accept new data?
+There's no way of knowing, so you trash that event.
+This means you have to record the intervals when the system goes busy.
+We do this by having digitizers output a signal via the LVDS connectors which we collect into the V1495 via ribbon cables.
+The V1495 monitors all these inputs, and if one board outputs a BUSY signal, the V1495 issues a VETO signal that is then fanned out to the TRG-IN of all digitizers.
+This VETO prevents all digitizers from accepting any new data.
+This state lasts until a few milliseconds have passed and all boards are reporting ``OK''.
+
+Issuing the VETO signal is only half, though.
+The VETO signal is important because it gives the readout time to clear all the boards.
+However we still need to know that BUSY happened and the system received a VETO.
+To do this, the V1495 outputs a short pulse (one clock cycle of the FPGA which is 3 digitizer samples wide) to the AM when it issues the VETO, and then another when the VETO ends.
+Thus, by looking at the AM data, you can reconstruct all the periods when at least one board wasn't able to collect new data, and you remove these periods from the analysis.
+
+\section{Computing hardware}
+
+There are three classes of server you need.
+One is for the digitizer-interfacing and the readout, one is for the live processing, and one is for ``supporting'' tasks, like hosting the databases, website, etc.
+The readout servers need lots of CPUs, the live-processing servers need lots of memory, and the supporting servers don't really need much of either.
+
+The readout servers need CPUs, the live-processing servers need memory, your database servers need a bit of both, and the rest can probably run on a Raspberry Pi.
+
+\section{Software}
+
+You end up needing quite a bit of this.
+The readout (in the strictest interpretation) is about 4.2k lines, the dispatcher is about 1.8k, bootstrax is a further 1.7k, ajax about 1k, and so on and so forth.
+Strax sits around 10k and straxen a further 14k, but it's ambiguous if these two packages are ``DAQ'' in a strict interpretation.
+
+\subsection{Firmware}
+
+Is this software?
+Is this hardware?
+That's philosophical.
+Either way, it looks like software and someone has to write it.
+It runs on the V1495 and DDC10, everything else is either proprietary (digitizers, etc) or a CPU.
+
+\subsection{Readout}
+
+We use redax for the purpose of pulling data from the digitizers and dumping it onto disk.
+It's a great piece of software.
+Failure here is not an option because if the readout stops running then data stops showing up on disk.
+
+\subsection{Live processing}
+
+We use bootstrax to oversee and manage the live processing.
+It has to deal with a lot of edge cases and things that might not work.
+It's allowed to crash occasionally because the data is already on disk by the time it gets to do things.
+
+\subsection{Support scripts}
+
+There's a lot that falls under this broad category.
+Is the dispatcher a ``supporting script'', or does it fall under ``readout''?
+What about the hypervisor?
+The various data-monitoring bots are definitely supporting scripts, as are the various things involved in maintenance of the databases, the logs, etc.
+Then there's the website.
+It's a website, it doesn't need its own section.
+If you know websites then this one doesn't do anything particularly fancy.
+If you don't know websites then it'll probably look like magic.
+Either way it's a very useful tool for system monitoring and control, and Slow Control would have a lot fewer problems if they used this approach for user interface.
